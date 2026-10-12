@@ -1,0 +1,178 @@
+name: AI PR Reviewer (shared)
+
+# Reusable workflow: Qodo PR-Agent reviewing PRs with Claude, on each caller
+# repo's own ANTHROPIC_KEY. Callers live at .github/workflows/pr_agent.yml in
+# each repo; see README.md in this repo for the caller snippet.
+#
+# Manual commands work in any PR comment: /review  /describe  /improve  /ask "..."
+#
+# Everything below runs in the CALLER's context: `github.event`,
+# `github.repository` and `github.token` all belong to the repo that called it.
+
+on:
+  workflow_call:
+    inputs:
+      extra_instructions:
+        description: Repo-specific review rules, appended to the shared adversarial base.
+        type: string
+        required: false
+        default: ""
+      model:
+        description: Primary model (litellm name).
+        type: string
+        required: false
+        default: anthropic/claude-opus-5
+      fallback_models:
+        description: >-
+          TOML array of fallback models, e.g. '["anthropic/claude-sonnet-5"]'.
+          Must be a plain array; the '@json [...]' form is passed through as a
+          literal string and silently breaks the fallback.
+        type: string
+        required: false
+        default: '["anthropic/claude-sonnet-5"]'
+      context_files:
+        description: TOML array of repo files fed to the reviewer as context.
+        type: string
+        required: false
+        default: '["CLAUDE.md", "AGENTS.md"]'
+      auto_describe:
+        description: >-
+          Rewrite the PR description when a PR opens for review. Never runs on a
+          push (synchronize), so a human-edited description is not overwritten.
+        type: boolean
+        required: false
+        default: true
+      review_on_push:
+        description: >-
+          Run an incremental review (/review -i) on every push to the PR. The
+          caller must ALSO list `synchronize` in its pull_request types. Off by
+          default because it is the expensive trigger.
+        type: boolean
+        required: false
+        default: false
+      max_model_tokens:
+        description: >-
+          Prompt budget. pr-agent defaults to 32000 regardless of the model's
+          real window, which silently truncates large diffs.
+        type: string
+        required: false
+        default: "64000"
+    secrets:
+      ANTHROPIC_KEY:
+        description: Anthropic API key. Set per repo (GitHub Free does not share org secrets with private repos).
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  pr_agent:
+    # Guards, in order:
+    # - never let a bot (including pr-agent itself) trigger a run;
+    # - comments only count on PRs, and only from OWNER/MEMBER/COLLABORATOR:
+    #   a comment command spends ANTHROPIC_KEY with a write token, and the
+    #   public repos take comments from anyone;
+    # - fork PRs get no secrets on pull_request, so skip instead of failing;
+    # - drafts wait: `ready_for_review` fires the first review when it matters.
+    #   A human `/review` on a draft still works (that is an issue_comment);
+    # - a push (synchronize) only does anything when the caller opted in.
+    if: >-
+      github.event.sender.type != 'Bot' &&
+      (
+        (github.event_name == 'pull_request' &&
+         github.event.pull_request.head.repo.full_name == github.repository &&
+         github.event.pull_request.draft == false &&
+         (github.event.action != 'synchronize' || inputs.review_on_push))
+        ||
+        (github.event_name == 'issue_comment' &&
+         github.event.issue.pull_request &&
+         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+                  github.event.comment.author_association))
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Cancel only a superseded push review. A blanket `true` let unrelated
+    # comments (bots, other people) cancel a real review on a fresh PR.
+    concurrency:
+      group: pr-agent-review-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' }}
+    steps:
+      - name: Record start time
+        id: start
+        # 60s of slack for clock skew between the runner and GitHub's timestamps.
+        run: echo "at=$(date -u -d '-60 seconds' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Run PR Agent
+        # Pinned by digest to pragent/pr-agent:0.44.0-github_action.
+        # qodo-ai/pr-agent@main builds FROM pragent/pr-agent:github_action, a
+        # mutable tag; the digest is what actually pins the code.
+        uses: docker://pragent/pr-agent@sha256:b70f4a41621a838cb0dfbc199f86f595ab9cfe698ac4b19ec2b5562b05d49858
+        env:
+          # --- model ---
+          CONFIG.MODEL: ${{ inputs.model }}
+          # Plain TOML arrays. NOT '@json [...]': that is passed through as a
+          # literal string (fallback model "@json [", context file "@json [...").
+          CONFIG.FALLBACK_MODELS: ${{ inputs.fallback_models }}
+          CONFIG.REPO_CONTEXT_FILES: ${{ inputs.context_files }}
+          CONFIG.MAX_MODEL_TOKENS: ${{ inputs.max_model_tokens }}
+
+          # --- credentials ---
+          ANTHROPIC.KEY: ${{ secrets.ANTHROPIC_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+
+          # --- what runs automatically ---
+          # Describe once, when a PR opens for review; never on a push, which
+          # would overwrite a human-edited description. Scoped to pull_request:
+          # on issue_comment the comment's own command runs instead.
+          GITHUB_ACTION_CONFIG.AUTO_DESCRIBE: >-
+            ${{ inputs.auto_describe && github.event_name == 'pull_request' &&
+                github.event.action != 'synchronize' }}
+          GITHUB_ACTION_CONFIG.AUTO_REVIEW: "true"
+          GITHUB_ACTION_CONFIG.AUTO_IMPROVE: "false"
+          # pr-agent ignores `synchronize` unless HANDLE_PUSH_TRIGGER is true
+          # (it logs "Skipping action: synchronize"). PUSH_COMMANDS is a plain
+          # string ('@json' fails here too) and must be non-empty; `-i` reviews
+          # only the commits since the last review, and falls back to a full
+          # review when there is no previous one.
+          GITHUB_ACTION_CONFIG.HANDLE_PUSH_TRIGGER: ${{ inputs.review_on_push }}
+          GITHUB_ACTION_CONFIG.PUSH_COMMANDS: "/review -i"
+
+          # --- adversarial review ---
+          PR_REVIEWER.EXTRA_INSTRUCTIONS: >-
+            Review adversarially: your job is to find what is wrong, not to
+            praise. Check the PR against every acceptance criterion of the
+            linked issue and say which are met, partial or missing. Look hardest
+            at edge cases (null or malformed input, empty lists, pagination
+            ends, errors and retries, double submits, stale state, time zones),
+            security and data scoping (authorization checks, tenant or user
+            isolation, secrets or personal data in code, logs or URLs, injection),
+            anything that could write to production, send email or messages,
+            or charge money unexpectedly, and whether the tests actually
+            exercise the risky paths; call out missing tests. Follow the
+            repository's CLAUDE.md and AGENTS.md if present. Give each finding
+            a severity (blocker, should-fix, nit) and a file:line. Skip style
+            nits a linter would catch.
+            ${{ inputs.extra_instructions }}
+
+      # pr-agent swallows model and auth failures and still exits 0. From
+      # 2026-10-02 the ANTHROPIC_KEY was expired and every review failed with
+      # "API key is invalid" while the job stayed green for a week. An
+      # automatic run must leave a review comment behind, or this fails.
+      - name: Verify a review was posted
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          SINCE: ${{ steps.start.outputs.at }}
+        run: |
+          count=$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
+            --jq "[.[] | select(.updated_at >= \"$SINCE\") | select(.body | test(\"pr-agent:review|PR Reviewer Guide\"))] | length" \
+            | awk '{s+=$1} END {print s+0}')
+          if [ "$count" -eq 0 ]; then
+            echo "::error::PR-Agent posted no review. Check the 'Run PR Agent' log for 'Failed to generate prediction' (e.g. an invalid or expired ANTHROPIC_KEY)."
+            exit 1
+          fi
+          echo "Review comment found ($count)."
